@@ -130,7 +130,7 @@ async def test_failed_attempt_loops_back_to_the_choice(monkeypatch: pytest.Monke
     # the form was re-shown, carrying the failure reason rather than aborting the flow
     assert session.form.await_count == 2
     assert session.form.await_args_list[1].kwargs["errors"] == {"base": "playback_auth_failed"}
-    pairing_mock.assert_called_with("/bin/librespot", PAIRING_DEVICE_NAME, "192.168.1.50")
+    pairing_mock.assert_called_with("/bin/librespot", PAIRING_DEVICE_NAME, "192.168.1.50", "")
 
 
 @pytest.mark.parametrize(
@@ -160,7 +160,9 @@ async def test_pairing_interface_is_a_local_address(
     session.progress_until = AsyncMock(side_effect=_run_awaitable)
 
     assert await setup_flow._authorize_playback(session, None) == STORED_CREDENTIALS
-    pairing_mock.assert_called_once_with("/bin/librespot", PAIRING_DEVICE_NAME, expected_interface)
+    pairing_mock.assert_called_once_with(
+        "/bin/librespot", PAIRING_DEVICE_NAME, expected_interface, ""
+    )
 
 
 def test_pairing_device_name_matches_setup_text() -> None:

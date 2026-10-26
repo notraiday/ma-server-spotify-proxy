@@ -32,6 +32,7 @@ from music_assistant_models.errors import (
     ProviderUnavailableError,
     ResourceTemporarilyUnavailable,
     RetriesExhausted,
+    SetupFailedError,
     UnsupportedFeaturedException,
 )
 from music_assistant_models.media_items import (
@@ -55,6 +56,7 @@ from music_assistant_models.streamdetails import StreamDetails
 
 from music_assistant.constants import CONF_ENTRY_UNOFFICIAL_PROVIDER
 from music_assistant.controllers.cache import use_cache
+from music_assistant.helpers.aiohttp_client import parse_http_proxy_url
 from music_assistant.helpers.app_vars import app_var
 from music_assistant.helpers.external_ids import (
     barcode_to_upc,
@@ -91,6 +93,7 @@ from .constants import (
     CONF_AUDIOBOOKS_SUPPORTED,
     CONF_CLIENT_ID,
     CONF_PLAYBACK_BACKEND,
+    CONF_PROXY_URL,
     CONF_REFRESH_TOKEN_DEV,
     CONF_REFRESH_TOKEN_GLOBAL,
     CONF_SPOTIFY_NORMALIZATION,
@@ -146,6 +149,8 @@ class SpotifyProvider(MusicProvider):
     # monotonic time until which the fallback to the global session is not logged again
     _dev_fallback_logged_until: float = 0.0
     backend: SpotifyPlaybackBackend
+    # HTTP proxy all Spotify traffic of this instance goes through, empty for a direct connection
+    proxy_url: str = ""
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """
@@ -196,6 +201,13 @@ class SpotifyProvider(MusicProvider):
         """Handle async initialization of the provider."""
         self.cache_dir = os.path.join(self.mass.cache_path, self.instance_id)
         self._playlist_pagination_states = OrderedDict()
+        # read once: the proxy only changes through a reconfigure, which reloads the provider
+        proxy_url = self.get_setup_value(CONF_PROXY_URL)
+        try:
+            # the setup flow only stores a valid proxy, but the stored value can be edited by hand
+            self.proxy_url = parse_http_proxy_url(proxy_url if isinstance(proxy_url, str) else "")
+        except ValueError as err:
+            raise SetupFailedError(f"The Spotify proxy is not usable: {err}") from err
         # global session (heavy rate limited) and developer session (custom client id)
         self._global_session = self._create_session(
             "global",
@@ -1131,6 +1143,7 @@ class SpotifyProvider(MusicProvider):
                 app_var("spotify_client_id"),  # Always use MA's global client ID
                 refresh_token,
                 "global",
+                self.proxy_url,
             )
             self.logger.debug("Successfully refreshed global access token")
         except LoginFailed as err:
@@ -1215,6 +1228,7 @@ class SpotifyProvider(MusicProvider):
                 cast("str", client_id),
                 refresh_token,
                 "developer",
+                self.proxy_url,
             )
             self.logger.debug("Successfully refreshed developer access token")
         except LoginFailed as err:
@@ -1952,6 +1966,7 @@ class SpotifyProvider(MusicProvider):
             get_auth,
             on_unauthorized,
             fallback_for_playback=fallback_for_playback,
+            proxy_url=self.proxy_url,
         )
 
     def _stored_account(self) -> dict[str, Any] | None:

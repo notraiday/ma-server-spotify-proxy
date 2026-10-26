@@ -22,6 +22,40 @@ parsing, StreamDetails and the audiobook chapter logic, and hands canonical
 `spotify:<type>:<id>` URIs to the backend behind the `SpotifyPlaybackBackend` contract
 (`backends/base.py`).
 
+## Proxy
+
+An instance can route all of its Spotify traffic through an HTTP proxy, for networks that
+only reach Spotify that way. The first step of the setup flow asks for it (empty means a
+direct connection) and stores it as `proxy_url` in the encrypted setup data, because it may
+carry a login. It is first so that the sign-in and the playback authorization that follow
+already go through it, and a proxy is only accepted once Spotify answers through it
+(a missing answer or a `407` fails the check; whatever Spotify itself replies does not).
+Changing it means going through the setup flow again (reconfigure).
+
+- Only `http://` and `https://` proxies (`host:port` is read as `http://host:port`; a login
+  goes in the address: `http://user:password@host:port`). SOCKS is not supported: librespot
+  can only tunnel through an HTTP proxy, so one setting could not cover both backends.
+  `parse_http_proxy_url` (`helpers/aiohttp_client.py`) normalizes the address.
+- **Web API, token refresh, setup flow requests**: aiohttp's `proxy`, with the login sent as
+  `Proxy-Authorization` on the tunnel (`get_proxy_request_kwargs`).
+- **librespot**: `--proxy <url>` and the usual proxy environment variables, for streaming,
+  the keymaster token check and the pairing daemon.
+- **Soloist**: the proxy environment variables for the engine (a run and the pairing), and
+  the engine download and update checks of `SoloistBinaryManager`, which go through the
+  proxy like any other request. The engine is closed source and Spotify's reference does not
+  mention proxies, so whether it honours these variables has to be established on a real
+  proxy (look for the engine's connections in the proxy's log).
+  Loopback is excluded through `NO_PROXY`, because the engine's local API lives there.
+
+The provider reads the proxy once at load (`SpotifyProvider.proxy_url`); a stored value that
+is not a usable HTTP proxy fails the load.
+
+Limits: librespot takes the proxy as a command line argument, so a login in the proxy address
+is visible to other processes of the same user for as long as a librespot process runs (the
+Soloist API key is on the engine's command line for the same reason). The proxy covers what
+this provider does itself; cover art is fetched by Music Assistant's generic image handling,
+which only follows the proxy environment variables of the server.
+
 ## Soloist specifics
 
 The heavy lifting (managed binary install with 90-day build expiry, WebSocket client,

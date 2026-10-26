@@ -120,17 +120,19 @@ class _FakeSession:
     def __init__(self, handler: _Handler) -> None:
         self.handler = handler
         self.requests: list[tuple[str, str]] = []
+        self.kwargs: list[dict[str, Any]] = []
 
-    def get(self, url: str, **_kwargs: Any) -> _FakeResponse:
+    def get(self, url: str, **kwargs: Any) -> _FakeResponse:
         """Issue a fake GET request."""
-        return self._request("GET", url)
+        return self._request("GET", url, kwargs)
 
-    def head(self, url: str, **_kwargs: Any) -> _FakeResponse:
+    def head(self, url: str, **kwargs: Any) -> _FakeResponse:
         """Issue a fake HEAD request."""
-        return self._request("HEAD", url)
+        return self._request("HEAD", url, kwargs)
 
-    def _request(self, method: str, url: str) -> _FakeResponse:
+    def _request(self, method: str, url: str, kwargs: dict[str, Any]) -> _FakeResponse:
         self.requests.append((method, url))
+        self.kwargs.append(kwargs)
         return self.handler(method, url)
 
 
@@ -150,11 +152,13 @@ def _offline(_method: str, _url: str) -> _FakeResponse:
     raise ClientError("no route to host")
 
 
-def _make_manager(tmp_path: Path, handler: _Handler) -> tuple[SoloistBinaryManager, _FakeSession]:
+def _make_manager(
+    tmp_path: Path, handler: _Handler, proxy_url: str = ""
+) -> tuple[SoloistBinaryManager, _FakeSession]:
     """Create a binary manager on a fake mass with the given request handler."""
     session = _FakeSession(handler)
     mass = SimpleNamespace(storage_path=str(tmp_path / "storage"), http_session=session)
-    return SoloistBinaryManager(cast("MusicAssistant", mass)), session
+    return SoloistBinaryManager(cast("MusicAssistant", mass), proxy_url=proxy_url), session
 
 
 def _install_dir(tmp_path: Path) -> Path:
@@ -459,6 +463,34 @@ async def test_refresh_installs_new_build(tmp_path: Path) -> None:
     diag = manager.diagnostics()
     assert diag["etag"] == '"v2"'
     assert diag["sha256"] == hashlib.sha256(build_b).hexdigest()
+
+
+@pytest.mark.usefixtures("linux_platform", "fake_version_cmd")
+async def test_downloads_and_update_checks_go_through_the_proxy(tmp_path: Path) -> None:
+    """The install, and the check for a newer build, are both made through the proxy."""
+    build_a = _build_archive(
+        tmp_path / "a.tar.gz", {"soloist": _elf_binary("x86_64", marker=b"GOOD-BUILD-A")}
+    )
+    manager, session = _make_manager(
+        tmp_path, _serve_archive(build_a, etag='"v1"'), "http://user:pw@proxy.lan:3128"
+    )
+    await manager.ensure_binary(consent=True)
+    _age_metadata(tmp_path)
+    await manager.ensure_fresh(consent=True)
+
+    assert {method for method, _url in session.requests} == {"GET", "HEAD"}
+    assert all(kwargs["proxy"] == "http://proxy.lan:3128" for kwargs in session.kwargs)
+    assert all("Proxy-Authorization" in kwargs["proxy_headers"] for kwargs in session.kwargs)
+
+
+@pytest.mark.usefixtures("linux_platform", "fake_version_cmd")
+async def test_downloads_are_direct_without_a_proxy(tmp_path: Path) -> None:
+    """A manager without a proxy asks for nothing about proxies."""
+    archive = _build_archive(tmp_path / "a.tar.gz", {"soloist": _elf_binary("x86_64")})
+    manager, session = _make_manager(tmp_path, _serve_archive(archive))
+    await manager.ensure_binary(consent=True)
+    assert session.kwargs
+    assert not any("proxy" in kwargs for kwargs in session.kwargs)
 
 
 @pytest.mark.usefixtures("linux_platform", "fake_version_cmd")

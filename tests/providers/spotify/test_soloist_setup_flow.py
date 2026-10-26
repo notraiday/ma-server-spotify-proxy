@@ -27,6 +27,7 @@ from music_assistant.providers.spotify.constants import (
     BACKEND_SOLOIST,
     CONF_LIBRESPOT_CREDENTIALS,
     CONF_PLAYBACK_BACKEND,
+    CONF_PROXY_URL,
     CONF_SOLOIST_API_KEY,
     CONF_SOLOIST_CONSENT,
     CONF_SOLOIST_SESSION_DIR,
@@ -261,7 +262,9 @@ async def test_pairing_from_another_account_is_rejected(
     )
     setup_data: dict[str, Any] = {}
 
-    async def _second_attempt_is_correct(_mass: Any, _key: str, data_dir: Path) -> None:
+    async def _second_attempt_is_correct(
+        _mass: Any, _key: str, data_dir: Path, _proxy_url: str = ""
+    ) -> None:
         account = "someoneelse" if len(paired_dirs) == 0 else "spotify-user"
         paired_dirs.append(data_dir)
         users = data_dir / "settings" / "Users" / f"{account}-user"
@@ -462,6 +465,64 @@ async def test_a_pairing_that_stored_no_account_is_not_mistaken_for_success(
         await pair_soloist_session(MagicMock(), "k" * 20, data_dir)
 
 
+async def test_pairing_downloads_and_runs_the_engine_through_the_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pairing installs the engine and talks to Spotify through the proxy, and only then."""
+    proxy_url = "http://user:pass@proxy.lan:3128"
+    data_dir = tmp_path / "data"
+    spawns: list[tuple[list[str], dict[str, Any]]] = []
+    _install_fake_soloist(monkeypatch, 0, on_wait=lambda: _store_session(data_dir), spawns=spawns)
+    mass = MagicMock()
+    await pair_soloist_session(mass, "k" * 20, data_dir, proxy_url)
+    spotify_helpers.SoloistBinaryManager.assert_called_once_with(  # type: ignore[attr-defined]
+        mass, proxy_url=proxy_url
+    )
+    args, kwargs = spawns[0]
+    assert kwargs["env"]["HTTPS_PROXY"] == kwargs["env"]["ALL_PROXY"] == proxy_url
+    # the proxy login stays out of the command line, where the daemon would echo it
+    assert "proxy.lan" not in " ".join(args)
+
+
+async def test_pairing_without_a_proxy_changes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a proxy the engine is installed and started as before."""
+    data_dir = tmp_path / "data"
+    spawns: list[tuple[list[str], dict[str, Any]]] = []
+    _install_fake_soloist(monkeypatch, 0, on_wait=lambda: _store_session(data_dir), spawns=spawns)
+    mass = MagicMock()
+    await pair_soloist_session(mass, "k" * 20, data_dir)
+    spotify_helpers.SoloistBinaryManager.assert_called_once_with(  # type: ignore[attr-defined]
+        mass, proxy_url=""
+    )
+    assert not spawns[0][1]["env"]
+
+
+async def test_the_flow_pairs_through_the_proxy_of_the_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pairing step of the flow is handed the proxy collected at its start."""
+    proxy_url = "http://proxy.lan:3128"
+    monkeypatch.setattr(setup_flow, "verify_platform_supported", MagicMock())
+    pair = AsyncMock()
+    monkeypatch.setattr(setup_flow, "pair_soloist_session", pair)
+    session = _make_session(
+        tmp_path,
+        [
+            {CONF_PLAYBACK_BACKEND: BACKEND_SOLOIST},
+            {CONF_SOLOIST_CONSENT: True},
+            {CONF_SOLOIST_API_KEY: "k" * 20},
+        ],
+    )
+    # nothing of the pairing is under test beyond what it is called with
+    monkeypatch.setattr(setup_flow, "_paired_account_differs", AsyncMock(return_value=False))
+    setup_data: dict[str, Any] = {CONF_PROXY_URL: proxy_url}
+    await setup_flow._setup_playback(session, setup_data, "spotify-user")
+    pair.assert_called_once()
+    assert pair.call_args.args[3] == proxy_url
+
+
 def _store_session(data_dir: Path, account: str = "spotify-user") -> None:
     """Write a paired session the way the engine records it."""
     (data_dir / "settings" / "Users" / f"{account}-user").mkdir(parents=True, exist_ok=True)
@@ -497,7 +558,7 @@ def _record_pairing(monkeypatch: pytest.MonkeyPatch, account: str | None = None)
     """
     paired_dirs: list[Path] = []
 
-    async def _fake_pair(_mass: Any, _api_key: str, data_dir: Path) -> None:
+    async def _fake_pair(_mass: Any, _api_key: str, data_dir: Path, _proxy_url: str = "") -> None:
         paired_dirs.append(data_dir)
         if account is not None:
             (data_dir / "settings" / "Users" / f"{account}-user").mkdir(parents=True)

@@ -6,6 +6,7 @@ import asyncio
 import logging
 import shutil
 from dataclasses import replace
+from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlencode
@@ -15,6 +16,7 @@ from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import ConfigEntryType
 from music_assistant_models.errors import LoginFailed
 
+from music_assistant.helpers.aiohttp_client import get_proxy_request_kwargs, parse_http_proxy_url
 from music_assistant.helpers.app_vars import app_var
 from music_assistant.helpers.json import json_loads
 from music_assistant.helpers.oauth import (
@@ -40,6 +42,7 @@ from .constants import (
     CONF_CLIENT_ID,
     CONF_LIBRESPOT_CREDENTIALS,
     CONF_PLAYBACK_BACKEND,
+    CONF_PROXY_URL,
     CONF_REFRESH_TOKEN_DEV,
     CONF_REFRESH_TOKEN_GLOBAL,
     CONF_SOLOIST_API_KEY,
@@ -75,9 +78,17 @@ LOGGER = logging.getLogger(__name__)
 
 # seconds to wait for the account lookup that gates the setup
 ACCOUNT_LOOKUP_TIMEOUT = 30
+# seconds to wait for Spotify to answer through a proxy that was just entered
+PROXY_CHECK_TIMEOUT = 15
 
 AUTHORIZE_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"  # noqa: S105 - URL
+
+CONF_ENTRY_PROXY_URL = ConfigEntry(
+    key=CONF_PROXY_URL,
+    type=ConfigEntryType.STRING,
+    required=False,
+)
 
 # the developer client id is a public OAuth identifier (not a secret), so it is a plain
 # STRING that can be prefilled on reconfigure
@@ -131,15 +142,20 @@ async def run_setup(session: SetupSession) -> None:
     """
     setup_data = dict(session.context.setup_data)
     try:
+        # asked first, so that everything after it reaches Spotify the way the network allows
+        proxy_url = await _ask_proxy(session, str(setup_data.get(CONF_PROXY_URL) or ""))
+        setup_data[CONF_PROXY_URL] = proxy_url or None
         # the global session always (re)authenticates: a refresh token cannot be reused across a
         # re-auth and secure values are never prefilled back into the flow
         token_result = await _pkce_authenticate(
-            session, app_var("spotify_client_id"), step_id="authenticate"
+            session, app_var("spotify_client_id"), step_id="authenticate", proxy_url=proxy_url
         )
         setup_data[CONF_REFRESH_TOKEN_GLOBAL] = str(token_result["refresh_token"])
         # an account that cannot work is turned away before the playback authorization
         # an unanswered lookup keeps the stored account id, the provider falls back on it
-        if account_id := await _verify_account(session, str(token_result["access_token"])):
+        if account_id := await _verify_account(
+            session, str(token_result["access_token"]), proxy_url
+        ):
             setup_data[CONF_ACCOUNT_ID] = account_id
         # playback authorization is separate from the Web API tokens and depends on
         # the explicitly chosen playback backend
@@ -177,6 +193,64 @@ async def run_setup(session: SetupSession) -> None:
         await _discard_pairing_dir(session)
 
 
+async def _ask_proxy(session: SetupSession, prefill: str) -> str:
+    """
+    Ask for the optional HTTP proxy Spotify traffic goes through and return it normalized.
+
+    An empty answer means a direct connection. A proxy is only accepted once Spotify answers
+    through it, so a typo is caught here rather than after the sign-in in the browser.
+
+    :param session: The setup session driving the flow.
+    :param prefill: The proxy stored by an earlier run.
+    """
+    errors: dict[str, str | SetupFlowError] | None = None
+    while True:
+        values = await session.form(
+            [replace(CONF_ENTRY_PROXY_URL, value=prefill)],
+            step_id="proxy",
+            errors=errors,
+        )
+        entered = str(values.get(CONF_PROXY_URL) or "")
+        try:
+            proxy_url = parse_http_proxy_url(entered)
+        except ValueError:
+            prefill = entered
+            errors = {CONF_PROXY_URL: "proxy_invalid"}
+            continue
+        if proxy_url and not await _proxy_reaches_spotify(session, proxy_url):
+            prefill = entered
+            errors = {CONF_PROXY_URL: "proxy_unreachable"}
+            continue
+        return proxy_url
+
+
+async def _proxy_reaches_spotify(session: SetupSession, proxy_url: str) -> bool:
+    """
+    Return whether Spotify answers through the proxy.
+
+    Only a failure to get an answer, or the proxy turning the request away, counts: what
+    Spotify itself replies to this request is of no interest.
+
+    :param session: The setup session driving the flow.
+    :param proxy_url: The proxy to try.
+    """
+    try:
+        async with session.mass.http_session.get(
+            "https://accounts.spotify.com/",
+            allow_redirects=False,
+            timeout=ClientTimeout(total=PROXY_CHECK_TIMEOUT),
+            **get_proxy_request_kwargs(proxy_url),
+        ) as response:
+            reached = response.status != HTTPStatus.PROXY_AUTHENTICATION_REQUIRED
+    except (ClientError, TimeoutError) as err:
+        # a bare TimeoutError stringifies to nothing, so log the type too
+        LOGGER.warning("Proxy check failed: %s %s", type(err).__name__, err)
+        return False
+    if not reached:
+        LOGGER.warning("Proxy check failed: the proxy asked for (other) credentials")
+    return reached
+
+
 async def _authorize_developer_key(
     session: SetupSession, setup_data: dict[str, Any], client_id_default: str
 ) -> tuple[str, dict[str, str | SetupFlowError] | None]:
@@ -197,15 +271,19 @@ async def _authorize_developer_key(
         translation_params=[HOSTED_CALLBACK_URL],
     )
     client_id = str(dev_values.get(CONF_CLIENT_ID) or "").strip()
+    proxy_url = str(setup_data.get(CONF_PROXY_URL) or "")
     try:
         if client_id:
             setup_data[CONF_CLIENT_ID] = client_id
             dev_token_result = await _pkce_authenticate(
-                session, client_id, step_id="authenticate_dev"
+                session, client_id, step_id="authenticate_dev", proxy_url=proxy_url
             )
             setup_data[CONF_REFRESH_TOKEN_DEV] = str(dev_token_result["refresh_token"])
             await _verify_developer_account(
-                session, str(dev_token_result["access_token"]), setup_data.get(CONF_ACCOUNT_ID)
+                session,
+                str(dev_token_result["access_token"]),
+                setup_data.get(CONF_ACCOUNT_ID),
+                proxy_url,
             )
         else:
             # opted in but left the field empty: keep using the shared key
@@ -217,7 +295,9 @@ async def _authorize_developer_key(
     return client_id, None
 
 
-async def _verify_account(session: SetupSession, access_token: str) -> str | None:
+async def _verify_account(
+    session: SetupSession, access_token: str, proxy_url: str = ""
+) -> str | None:
     """
     Check the just-authenticated Spotify account and return its id.
 
@@ -230,9 +310,10 @@ async def _verify_account(session: SetupSession, access_token: str) -> str | Non
     :param access_token: The access token from the just-completed sign-in. Reusing
         it is deliberate — minting a fresh one rotates the refresh token, which
         revokes the one just stored as setup data.
+    :param proxy_url: HTTP proxy to reach Spotify through, empty for a direct connection.
     :raises AbortFlow: When the account is non-Premium or already configured.
     """
-    if (userinfo := await _get_profile(session, access_token)) is None:
+    if (userinfo := await _get_profile(session, access_token, proxy_url)) is None:
         return None
     product = str(userinfo.get("product") or "")
     if product and product != "premium":
@@ -245,7 +326,7 @@ async def _verify_account(session: SetupSession, access_token: str) -> str | Non
 
 
 async def _verify_developer_account(
-    session: SetupSession, access_token: str, account_id: str | None
+    session: SetupSession, access_token: str, account_id: str | None, proxy_url: str = ""
 ) -> None:
     """
     Refuse a developer key that was authorized with another Spotify account.
@@ -256,10 +337,11 @@ async def _verify_developer_account(
     :param session: The setup session driving the flow.
     :param access_token: The access token from the developer key sign-in.
     :param account_id: The Spotify user id of the main sign-in, when known.
+    :param proxy_url: HTTP proxy to reach Spotify through, empty for a direct connection.
     :raises SetupFlowError: When the developer key signed in with a different account, so
         the step is shown again with that message.
     """
-    if not account_id or (userinfo := await _get_profile(session, access_token)) is None:
+    if not account_id or (userinfo := await _get_profile(session, access_token, proxy_url)) is None:
         return
     if (dev_account_id := str(userinfo.get("id") or "")) and dev_account_id != account_id:
         raise SetupFlowError(
@@ -268,18 +350,22 @@ async def _verify_developer_account(
         )
 
 
-async def _get_profile(session: SetupSession, access_token: str) -> dict[str, Any] | None:
+async def _get_profile(
+    session: SetupSession, access_token: str, proxy_url: str = ""
+) -> dict[str, Any] | None:
     """
     Return the Spotify profile of the signed-in account, or None when Spotify does not answer.
 
     :param session: The setup session driving the flow.
     :param access_token: The access token of the account to look up.
+    :param proxy_url: HTTP proxy to reach Spotify through, empty for a direct connection.
     """
     try:
         async with session.mass.http_session.get(
             "https://api.spotify.com/v1/me",
             headers={"Authorization": f"Bearer {access_token}"},
             timeout=ClientTimeout(total=ACCOUNT_LOOKUP_TIMEOUT),
+            **get_proxy_request_kwargs(proxy_url),
         ) as response:
             if response.status != 200:
                 LOGGER.warning("Account check skipped: Spotify replied HTTP %s", response.status)
@@ -352,7 +438,9 @@ async def _setup_playback(
             # the librespot credential is of no further use
             setup_data[CONF_LIBRESPOT_CREDENTIALS] = None
         else:
-            setup_data[CONF_LIBRESPOT_CREDENTIALS] = await _authorize_playback(session, account_id)
+            setup_data[CONF_LIBRESPOT_CREDENTIALS] = await _authorize_playback(
+                session, account_id, str(setup_data.get(CONF_PROXY_URL) or "")
+            )
             # switching away from soloist: overwrite the soloist secrets; they
             # only reach the stored setup_data when finish() succeeds, so an
             # aborted or failed switch keeps them intact
@@ -586,7 +674,12 @@ async def _pair_soloist(session: SetupSession, setup_data: dict[str, Any]) -> No
     pairing_dir = f"{SOLOIST_PAIRING_DIR}/{session.flow_id}"
     api_key = str(setup_data.get(CONF_SOLOIST_API_KEY) or "")
     await session.progress_until(
-        pair_soloist_session(session.mass, api_key, Path(session.mass.storage_path) / pairing_dir),
+        pair_soloist_session(
+            session.mass,
+            api_key,
+            Path(session.mass.storage_path) / pairing_dir,
+            str(setup_data.get(CONF_PROXY_URL) or ""),
+        ),
         step_id="soloist_pairing",
         text="soloist_pairing_instructions",
         expires_in=PAIRING_TIMEOUT,
@@ -610,7 +703,9 @@ async def _discard_pairing_dir(session: SetupSession) -> None:
     )
 
 
-async def _authorize_playback(session: SetupSession, account_id: str | None) -> str:
+async def _authorize_playback(
+    session: SetupSession, account_id: str | None, proxy_url: str = ""
+) -> str:
     """
     Obtain librespot's playback credential and return it as stored-credential JSON.
 
@@ -623,6 +718,7 @@ async def _authorize_playback(session: SetupSession, account_id: str | None) -> 
     :param session: The setup session driving the flow.
     :param account_id: The signed-in Spotify user id to match the credential against;
         the check is skipped when it (or the credential's own account) is unknown.
+    :param proxy_url: HTTP proxy to reach Spotify through, empty for a direct connection.
     """
     try:
         librespot_bin = await get_librespot_binary()
@@ -646,14 +742,16 @@ async def _authorize_playback(session: SetupSession, account_id: str | None) -> 
             if method == PLAYBACK_AUTH_APP:
                 credentials = await session.progress_until(
                     librespot_credentials_via_pairing(
-                        librespot_bin, PAIRING_DEVICE_NAME, zeroconf_interface
+                        librespot_bin, PAIRING_DEVICE_NAME, zeroconf_interface, proxy_url
                     ),
                     step_id="playback_pairing",
                     text="pairing_instructions",
                     expires_in=PAIRING_TIMEOUT,
                 )
             else:
-                credentials = await _authorize_playback_via_browser(session, librespot_bin)
+                credentials = await _authorize_playback_via_browser(
+                    session, librespot_bin, proxy_url
+                )
             if _credential_account_differs(credentials, account_id):
                 errors = {"base": "playback_account_mismatch"}
                 continue
@@ -701,7 +799,9 @@ def _credential_account_differs(credentials: str, account_id: str | None) -> boo
     return True
 
 
-async def _authorize_playback_via_browser(session: SetupSession, librespot_bin: str) -> str:
+async def _authorize_playback_via_browser(
+    session: SetupSession, librespot_bin: str, proxy_url: str = ""
+) -> str:
     """
     Run the keymaster sign-in and return librespot's stored credential.
 
@@ -711,6 +811,7 @@ async def _authorize_playback_via_browser(session: SetupSession, librespot_bin: 
 
     :param session: The setup session driving the flow.
     :param librespot_bin: Path to the librespot binary.
+    :param proxy_url: HTTP proxy to reach Spotify through, empty for a direct connection.
     """
     code_verifier, code_challenge = generate_pkce_pair()
     params = {
@@ -747,23 +848,30 @@ async def _authorize_playback_via_browser(session: SetupSession, librespot_bin: 
         "client_id": KEYMASTER_CLIENT_ID,
         "code_verifier": code_verifier,
     }
-    async with session.mass.http_session.post(TOKEN_URL, data=token_params) as response:
+    async with session.mass.http_session.post(
+        TOKEN_URL, data=token_params, **get_proxy_request_kwargs(proxy_url)
+    ) as response:
         if response.status != 200:
             raise SetupFlowError(
                 f"Failed to get access token: {await response.text()}",
                 translation_key="playback_code_invalid",
             )
         token_result = await response.json()
-    return await librespot_credentials_via_token(librespot_bin, token_result["access_token"])
+    return await librespot_credentials_via_token(
+        librespot_bin, token_result["access_token"], proxy_url
+    )
 
 
-async def _pkce_authenticate(session: SetupSession, client_id: str, step_id: str) -> dict[str, Any]:
+async def _pkce_authenticate(
+    session: SetupSession, client_id: str, step_id: str, proxy_url: str = ""
+) -> dict[str, Any]:
     """
     Run the Spotify PKCE auth flow and return the token result (refresh + access token).
 
     :param session: The setup session driving the flow.
     :param client_id: The Spotify client id to authenticate with.
     :param step_id: The external step id (also the i18n key segment).
+    :param proxy_url: HTTP proxy to reach Spotify through, empty for a direct connection.
     """
     code_verifier, code_challenge = generate_pkce_pair()
     redirect_uri, state = hosted_bounce_redirect(session.callback_url)
@@ -787,7 +895,9 @@ async def _pkce_authenticate(session: SetupSession, client_id: str, step_id: str
         "client_id": client_id,
         "code_verifier": code_verifier,
     }
-    async with session.mass.http_session.post(TOKEN_URL, data=token_params) as response:
+    async with session.mass.http_session.post(
+        TOKEN_URL, data=token_params, **get_proxy_request_kwargs(proxy_url)
+    ) as response:
         if response.status != 200:
             raise SetupFlowError(f"Failed to get access token: {await response.text()}")
         token_result: dict[str, Any] = await response.json()

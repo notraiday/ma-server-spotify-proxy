@@ -3,6 +3,9 @@
     "client_id": {
       "label": "Client ID (optional)"
     },
+    "proxy_url": {
+      "label": "Proxy server (optional)"
+    },
     "sync_podcast_progress": {
       "label": "Sync Podcast Progress from Spotify",
       "description": "Automatically sync episode played status from Spotify to Music Assistant. Episodes marked as played in Spotify will be marked as played in MA. Only enable this if you use both the Spotify app and Music Assistant for podcast playback."
@@ -66,6 +69,10 @@
     "abort": {
       "account_already_configured": "This Spotify account is already set up in Music Assistant. Each account can only be added once — sign in with a different account, or reconfigure the existing one instead.",
       "premium_required": "A Spotify Premium account is required to use Spotify within Music Assistant. Sign in with a Premium account, or upgrade this one, and try again."
+    },
+    "proxy": {
+      "title": "Connect through a proxy?",
+      "description": "Most people can skip this. If your network only reaches Spotify through an HTTP proxy, enter it below and Music Assistant will use it for everything this Spotify account does: signing in, browsing and playing music.\n\nWrite it as `host:port`, or as `http://user:password@host:port` if it needs a login. SOCKS proxies are not supported. Leave the field empty to connect directly.\n\nTo change it later, reconfigure this provider."
     },
     "authenticate": {
       "title": "Connect your Spotify account",
@@ -141,6 +148,8 @@
     }
   },
   "errors": {
+    "proxy_invalid": "That is not a usable proxy address. Write it as host:port or http://host:port. SOCKS proxies are not supported.",
+    "proxy_unreachable": "Spotify could not be reached through that proxy. Check the address and the login (if it needs one), and make sure the Music Assistant server can reach the proxy.",
     "developer_account_mismatch": "The Client ID must be authorized with the same Spotify account you signed in with first. Sign in with that account when authorizing the Client ID, and try again.",
     "refresh_token_invalid": "Your Spotify session has expired or been revoked. Please re-authenticate to continue using Spotify.",
     "pairing_not_completed": "Music Assistant Pairing wasn't selected in the Spotify app in time. Try again, or use the web browser option if Music Assistant Pairing doesn't appear in your Spotify app.",

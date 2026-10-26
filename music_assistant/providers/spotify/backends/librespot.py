@@ -18,7 +18,11 @@ from music_assistant.providers.spotify.constants import (
     CONF_LIBRESPOT_CREDENTIALS,
     CREDENTIALS_FILE,
 )
-from music_assistant.providers.spotify.helpers import get_librespot_binary
+from music_assistant.providers.spotify.helpers import (
+    get_librespot_binary,
+    get_librespot_proxy_args,
+    get_proxy_env,
+)
 
 from .base import SpotifyPlaybackBackend
 
@@ -107,6 +111,9 @@ class LibrespotBackend(SpotifyPlaybackBackend):
         if not self._librespot_bin:
             raise AudioError("Spotify playback could not be set up")
 
+        # handed over as librespot's own option and through the usual proxy variables, so
+        # whichever way a connection of its is set up, it goes through the proxy
+        proxy_url = self.provider.proxy_url
         args = [
             self._librespot_bin,
             "--cache",
@@ -122,6 +129,7 @@ class LibrespotBackend(SpotifyPlaybackBackend):
             "--disable-discovery",
             "--dither",
             "none",
+            *get_librespot_proxy_args(proxy_url),
         ]
         if seek_position:
             args += ["--start-position", str(int(seek_position))]
@@ -131,6 +139,7 @@ class LibrespotBackend(SpotifyPlaybackBackend):
             stdout=True,
             stderr=True,
             name="librespot",
+            env=get_proxy_env(proxy_url),
         ) as librespot_proc:
             log_history: deque[str] = deque(maxlen=10)
             logger = self.logger

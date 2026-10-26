@@ -15,6 +15,7 @@ from music_assistant_models.errors import (
 )
 from orjson import JSONDecodeError
 
+from music_assistant.helpers.aiohttp_client import get_proxy_request_kwargs
 from music_assistant.helpers.json import json_loads
 from music_assistant.helpers.throttle_retry import (
     RequestPriority,
@@ -48,6 +49,7 @@ class SpotifySession:
         get_auth: Callable[[], Awaitable[dict[str, Any]]],
         on_unauthorized: Callable[[], None],
         fallback_for_playback: bool = False,
+        proxy_url: str = "",
     ) -> None:
         """
         Initialize the session.
@@ -60,6 +62,7 @@ class SpotifySession:
         :param on_unauthorized: Called when Spotify rejects the access token of this session.
         :param fallback_for_playback: Whether another session serves playback while this one is
             rate limited, so a playback request gives up on a limit at once.
+        :param proxy_url: HTTP proxy the requests of this session go through, empty for none.
         """
         self.mass = mass
         self.logger = logger
@@ -68,6 +71,7 @@ class SpotifySession:
         self._get_auth = get_auth
         self._on_unauthorized = on_unauthorized
         self._fallback_for_playback = fallback_for_playback
+        self._proxy_kwargs = get_proxy_request_kwargs(proxy_url)
 
     @throttle_with_retries
     async def get(
@@ -215,7 +219,7 @@ class SpotifySession:
             auth_info = await self._get_auth()
         headers = {**(headers or {}), "Authorization": f"Bearer {auth_info['access_token']}"}
         async with self.mass.http_session.request(
-            method, f"{API_URL}/{endpoint}", headers=headers, **kwargs
+            method, f"{API_URL}/{endpoint}", headers=headers, **self._proxy_kwargs, **kwargs
         ) as response:
             # handle spotify rate limiter
             if response.status == 429:

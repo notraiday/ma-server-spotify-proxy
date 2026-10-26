@@ -20,6 +20,7 @@ from music_assistant_models.errors import (
     ResourceTemporarilyUnavailable,
 )
 
+from music_assistant.helpers.aiohttp_client import get_proxy_request_kwargs
 from music_assistant.helpers.json import json_loads
 from music_assistant.helpers.process import AsyncProcess, check_output
 from music_assistant.helpers.throttle_retry import parse_retry_after
@@ -52,6 +53,37 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
 
 
+def get_proxy_env(proxy_url: str) -> dict[str, str]:
+    """
+    Return the environment that routes a subprocess's HTTP traffic through the proxy.
+
+    Loopback stays direct: Soloist's local WebSocket API and the pulse server are never
+    meant to leave the host.
+
+    :param proxy_url: The proxy URL, empty for none.
+    """
+    if not proxy_url:
+        return {}
+    no_proxy = ",".join(
+        part for part in (os.environ.get("NO_PROXY"), "localhost,127.0.0.1,::1") if part
+    )
+    env = dict.fromkeys(
+        ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"),
+        proxy_url,
+    )
+    env.update(dict.fromkeys(("NO_PROXY", "no_proxy"), no_proxy))
+    return env
+
+
+def get_librespot_proxy_args(proxy_url: str) -> list[str]:
+    """
+    Return the librespot arguments that route its connections through the proxy.
+
+    :param proxy_url: The proxy URL, empty for none.
+    """
+    return ["--proxy", proxy_url] if proxy_url else []
+
+
 async def get_librespot_binary() -> str:
     """Find the correct librespot binary belonging to the platform."""
 
@@ -78,7 +110,10 @@ async def get_librespot_binary() -> str:
 
 
 async def librespot_credentials_via_pairing(
-    librespot_bin: str, device_name: str, zeroconf_interface: str | None = None
+    librespot_bin: str,
+    device_name: str,
+    zeroconf_interface: str | None = None,
+    proxy_url: str = "",
 ) -> str:
     """
     Advertise a Spotify Connect device and return the credential librespot stores once paired.
@@ -90,6 +125,7 @@ async def librespot_credentials_via_pairing(
     :param device_name: Device name to advertise to the Spotify app.
     :param zeroconf_interface: Local IP to advertise the pairing device on, or None to advertise
         on all interfaces.
+    :param proxy_url: HTTP proxy to reach Spotify through, empty for a direct connection.
     """
     with tempfile.TemporaryDirectory() as cache_dir:
         args = [
@@ -101,6 +137,7 @@ async def librespot_credentials_via_pairing(
             "pipe",
             "--name",
             device_name,
+            *get_librespot_proxy_args(proxy_url),
         ]
         if zeroconf_interface:
             # otherwise librespot advertises on every interface, Docker bridges included
@@ -108,7 +145,11 @@ async def librespot_credentials_via_pairing(
         # stdout carries decoded audio once the user hits play; discard it so the pairing
         # daemon never blocks on a pipe nobody reads
         async with AsyncProcess(
-            args, stdout=asyncio.subprocess.DEVNULL, stderr=True, name="librespot-pairing"
+            args,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=True,
+            name="librespot-pairing",
+            env=get_proxy_env(proxy_url),
         ) as librespot_proc:
             # librespot advertises over mDNS, which fails silently in host-network-less
             # containers; without its log the user would just watch the step time out
@@ -118,12 +159,15 @@ async def librespot_credentials_via_pairing(
             return await _await_credentials_file(cache_dir)
 
 
-async def librespot_credentials_via_token(librespot_bin: str, access_token: str) -> str:
+async def librespot_credentials_via_token(
+    librespot_bin: str, access_token: str, proxy_url: str = ""
+) -> str:
     """
     Exchange a keymaster access token for librespot's reusable stored credential.
 
     :param librespot_bin: Path to the librespot binary.
     :param access_token: Spotify access token minted with the keymaster client id.
+    :param proxy_url: HTTP proxy to reach Spotify through, empty for a direct connection.
     :raises LoginFailed: When librespot could not turn the token into a stored credential.
     """
     with tempfile.TemporaryDirectory() as cache_dir:
@@ -134,6 +178,8 @@ async def librespot_credentials_via_token(librespot_bin: str, access_token: str)
             "--check-auth",
             "--access-token",
             access_token,
+            *get_librespot_proxy_args(proxy_url),
+            env=get_proxy_env(proxy_url),
             timeout=CHECK_AUTH_TIMEOUT,
         )
         if returncode != 0:
@@ -146,7 +192,9 @@ async def librespot_credentials_via_token(librespot_bin: str, access_token: str)
         return await asyncio.to_thread(_read_credentials_file, credentials_file)
 
 
-async def pair_soloist_session(mass: MusicAssistant, api_key: str, data_dir: Path) -> None:
+async def pair_soloist_session(
+    mass: MusicAssistant, api_key: str, data_dir: Path, proxy_url: str = ""
+) -> None:
     """
     Pair a Spotify account with soloist and store the session in the given data dir.
 
@@ -157,9 +205,10 @@ async def pair_soloist_session(mass: MusicAssistant, api_key: str, data_dir: Pat
     :param mass: The MusicAssistant instance.
     :param api_key: The user's personal Soloist API key (secret, kept out of all logs).
     :param data_dir: Directory the paired session is stored in.
+    :param proxy_url: HTTP proxy to reach Spotify through, empty for a direct connection.
     :raises LoginFailed: When pairing did not complete with a stored session.
     """
-    binary = await SoloistBinaryManager(mass).ensure_fresh(consent=True)
+    binary = await SoloistBinaryManager(mass, proxy_url=proxy_url).ensure_fresh(consent=True)
 
     def _prepare() -> None:
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -190,6 +239,7 @@ async def pair_soloist_session(mass: MusicAssistant, api_key: str, data_dir: Pat
             stdout=True,
             stderr=asyncio.subprocess.STDOUT,
             name="soloist-pair",
+            env=get_proxy_env(proxy_url),
         ) as pair_proc:
             log_task = asyncio.create_task(_log_soloist_pairing_output(pair_proc, api_key))
             try:
@@ -275,6 +325,7 @@ async def get_spotify_token(
     client_id: str,
     refresh_token: str,
     session_name: str = "spotify",
+    proxy_url: str = "",
 ) -> dict[str, Any]:
     """
     Refresh Spotify access token using refresh token.
@@ -283,6 +334,7 @@ async def get_spotify_token(
     :param client_id: Spotify client ID.
     :param refresh_token: Spotify refresh token.
     :param session_name: Name for logging purposes.
+    :param proxy_url: HTTP proxy to reach Spotify through, empty for a direct connection.
     :return: Auth info dict with access_token, refresh_token, expires_at.
     :raises RateLimited: When Spotify rate limits the token refresh.
     :raises ResourceTemporarilyUnavailable: When Spotify fails with a server error.
@@ -293,7 +345,9 @@ async def get_spotify_token(
         "refresh_token": refresh_token,
         "client_id": client_id,
     }
-    async with http_session.post("https://accounts.spotify.com/api/token", data=params) as response:
+    async with http_session.post(
+        "https://accounts.spotify.com/api/token", data=params, **get_proxy_request_kwargs(proxy_url)
+    ) as response:
         if response.status == 429:
             raise RateLimited(
                 f"Spotify rate limits the {session_name} token refresh",

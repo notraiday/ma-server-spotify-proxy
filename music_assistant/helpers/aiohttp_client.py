@@ -208,3 +208,55 @@ def get_socks5_url(url_string: str) -> str:
         if "://" not in url_string:
             url_string = f"socks5://{url_string}"
     return str(url_string)
+
+
+def parse_http_proxy_url(value: str) -> str:
+    """
+    Return the normalized URL of an HTTP proxy, or an empty string when none is given.
+
+    :param value: The proxy as entered: ``host:port``, or a full
+        ``http(s)://[user:password@]host:port`` URL.
+    :raises ValueError: When the value is not a usable HTTP proxy address.
+    """
+    value = value.strip()
+    if not value:
+        return ""
+    if "://" not in value:
+        value = f"http://{value}"
+    url = URL(value)
+    if url.scheme not in ("http", "https"):
+        msg = f"Unsupported proxy scheme '{url.scheme}': only http and https proxies are supported"
+        raise ValueError(msg)
+    if not url.host:
+        msg = "The proxy address has no host"
+        raise ValueError(msg)
+    if url.explicit_port is None:
+        msg = "The proxy address has no port"
+        raise ValueError(msg)
+    # rebuilt from its parts, which drops any path, query or fragment; the port stays explicit
+    # because str(URL) leaves out a scheme's default port
+    host = f"[{url.raw_host}]" if ":" in (url.raw_host or "") else url.raw_host
+    credentials = ""
+    if url.raw_user is not None:
+        credentials = url.raw_user
+        if url.raw_password is not None:
+            credentials += f":{url.raw_password}"
+        credentials += "@"
+    return f"{url.scheme}://{credentials}{host}:{url.explicit_port}"
+
+
+def get_proxy_request_kwargs(proxy_url: str) -> dict[str, Any]:
+    """
+    Return the aiohttp request arguments that route a request through an HTTP proxy.
+
+    :param proxy_url: A URL as returned by parse_http_proxy_url, empty for no proxy.
+    """
+    if not proxy_url:
+        return {}
+    url = URL(proxy_url)
+    kwargs: dict[str, Any] = {"proxy": str(url.with_user(None))}
+    if url.user:
+        kwargs["proxy_headers"] = {
+            "Proxy-Authorization": aiohttp.encode_basic_auth(url.user, url.password or "")
+        }
+    return kwargs

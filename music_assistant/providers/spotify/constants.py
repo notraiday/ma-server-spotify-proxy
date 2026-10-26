@@ -18,6 +18,9 @@ CONF_ACCOUNT_ID = "account_id"  # Spotify user id this instance serves (one inst
 CONF_ACCOUNT_NAME = "account_name"
 CONF_ACCOUNT_COUNTRY = "account_country"
 CONF_AUDIOBOOKS_SUPPORTED = "audiobooks_supported"
+# HTTP proxy all Spotify traffic of this instance is routed through (setup data, since it may
+# hold credentials). Empty or unset means a direct connection.
+CONF_PROXY_URL = "proxy_url"
 
 # Playback backend selection; configs predating the choice default to librespot
 CONF_PLAYBACK_BACKEND = "playback_backend"

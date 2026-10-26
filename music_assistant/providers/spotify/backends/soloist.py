@@ -48,7 +48,7 @@ from music_assistant.providers.spotify.constants import (
     SOLOIST_DATA_DIR_NAME,
     SOLOIST_DEVICE_NAME,
 )
-from music_assistant.providers.spotify.helpers import soloist_session_present
+from music_assistant.providers.spotify.helpers import get_proxy_env, soloist_session_present
 from music_assistant.providers.spotify_connect.base import (
     AUDIO_QUALITY_LOSSLESS,
     spotify_source_audio_format,
@@ -278,7 +278,7 @@ class SoloistBackend(SpotifyPlaybackBackend):
             )
         # setup errors (unsupported platform, missing consent, download failure,
         # expired build) propagate so the provider load fails with a clear error
-        manager = SoloistBinaryManager(self.mass)
+        manager = self._binary_manager()
         self._binary = await manager.ensure_fresh(self._consent)
         await self._adopt_paired_session()
         if not await asyncio.to_thread(self._has_stored_session):
@@ -385,9 +385,7 @@ class SoloistBackend(SpotifyPlaybackBackend):
                     # cheap thanks to the shared verify cache; swaps in a fresh build
                     # when the installed one is nearing its 90-day expiry
                     try:
-                        self._binary = await SoloistBinaryManager(self.mass).ensure_fresh(
-                            self._consent
-                        )
+                        self._binary = await self._binary_manager().ensure_fresh(self._consent)
                     except SoloistError as err:
                         raise AudioError(f"Spotify Soloist binary unavailable: {err}") from err
                     fresh = _SingleTrackRun(self, spotify_uri, seek_position * 1000, streamdetails)
@@ -469,6 +467,10 @@ class SoloistBackend(SpotifyPlaybackBackend):
         return "".join(
             ch if ch.isalnum() or ch in "_.-" else "_" for ch in self.provider.instance_id
         )
+
+    def _binary_manager(self) -> SoloistBinaryManager:
+        """Return the manager of the shared engine install, downloading through the proxy."""
+        return SoloistBinaryManager(self.mass, proxy_url=self.provider.proxy_url)
 
     def _run_for(self, streamdetails: StreamDetails) -> _SingleTrackRun | None:
         """
@@ -686,7 +688,7 @@ class _SingleTrackRun:
             # the explicit process name keeps AsyncProcess logging free of the
             # argv (which carries the API key)
             name=f"soloist[{backend.provider.name}]",
-            env=server.child_env(sink.sink_name),
+            env={**server.child_env(sink.sink_name), **get_proxy_env(backend.provider.proxy_url)},
         )
         await proc.start()
         # kept out of _tasks so stop() does not cancel it before the daemon has
@@ -923,7 +925,7 @@ class _SingleTrackRun:
         """Replace the expired soloist build and fail the item with an accurate message."""
         try:
             # bypass the verify cache — it would hand back the same expired binary
-            self.backend._binary = await SoloistBinaryManager(self.mass).ensure_fresh(
+            self.backend._binary = await self.backend._binary_manager().ensure_fresh(
                 self.backend._consent, force=True
             )
         except SoloistError as err:

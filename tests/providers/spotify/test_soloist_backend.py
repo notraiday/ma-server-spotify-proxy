@@ -27,6 +27,7 @@ from music_assistant_models.streamdetails import StreamDetails
 
 from music_assistant.helpers import process as process_module
 from music_assistant.helpers.process import AsyncProcess
+from music_assistant.helpers.pulse_capture import PipeSink
 from music_assistant.models.music_provider import ProviderStreamLimitError
 from music_assistant.providers.spotify.backends import StreamSupersededError
 from music_assistant.providers.spotify.backends import soloist as soloist_backend
@@ -858,3 +859,110 @@ async def test_a_seek_replaces_the_held_run(tmp_path: Path) -> None:
     held.stop.assert_awaited_once()
     assert run is not held
     assert backend._run is run
+
+
+PROXY = "http://user:pass@proxy.lan:3128"
+
+
+class _EngineSpawned(Exception):
+    """Raised by the stand-in engine process once it is started, to stop the run there."""
+
+
+async def _engine_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, proxy_url: str
+) -> tuple[list[str], dict[str, Any]]:
+    """Start a run on an instance with the given proxy, return the argv and kwargs of the spawn."""
+    backend = _make_backend(tmp_path, {CONF_SOLOIST_API_KEY: "k" * 20})
+    backend.provider.proxy_url = proxy_url
+    backend._binary = tmp_path / "soloist-bin"
+    backend._server = MagicMock(
+        child_env=MagicMock(return_value={"PULSE_SERVER": "unix:/pulse", "HOME": "/home/ma"})
+    )
+    sink = AsyncMock()
+    sink.sink_name = "capture-sink"
+    monkeypatch.setattr(PipeSink, "create", AsyncMock(return_value=sink))
+    spawns: list[tuple[list[str], dict[str, Any]]] = []
+
+    class _StandInProcess:
+        def __init__(self, args: list[str], **kwargs: Any) -> None:
+            spawns.append((args, kwargs))
+
+        async def start(self) -> None:
+            raise _EngineSpawned
+
+    monkeypatch.setattr(soloist_backend, "AsyncProcess", _StandInProcess)
+    run = _SingleTrackRun(backend, TRACK_A, 0, _streamdetails_for())
+    with pytest.raises(_EngineSpawned):
+        await run.start()
+    return spawns[0]
+
+
+async def test_the_engine_runs_through_the_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The engine is told the proxy in the environment, next to what puts it on its sink."""
+    args, kwargs = await _engine_spawn(tmp_path, monkeypatch, PROXY)
+    env = kwargs["env"]
+    assert env["HTTPS_PROXY"] == env["https_proxy"] == env["ALL_PROXY"] == PROXY
+    assert env["PULSE_SERVER"] == "unix:/pulse"
+    assert env["HOME"] == "/home/ma"
+    # loopback, where the engine's own API listens, is never sent through it
+    assert "127.0.0.1" in env["NO_PROXY"].split(",")
+    # the login of the proxy belongs in the environment, not on the command line
+    assert PROXY not in " ".join(args)
+    assert "proxy.lan" not in " ".join(args)
+
+
+async def test_the_engine_runs_directly_without_a_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a proxy the engine gets exactly the environment it always got."""
+    _, kwargs = await _engine_spawn(tmp_path, monkeypatch, "")
+    assert kwargs["env"] == {"PULSE_SERVER": "unix:/pulse", "HOME": "/home/ma"}
+
+
+def _manager_class(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """Replace the binary manager class, returning it to see how it is constructed."""
+    manager = MagicMock()
+    manager.ensure_fresh = AsyncMock(return_value=Path("/nonexistent/soloist"))
+    manager_class = MagicMock(return_value=manager)
+    monkeypatch.setattr(soloist_backend, "SoloistBinaryManager", manager_class)
+    return manager_class
+
+
+async def test_setup_downloads_the_engine_through_the_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first install of the engine comes in through the proxy."""
+    backend = _make_backend(tmp_path, {CONF_SOLOIST_API_KEY: "k" * 20, CONF_SOLOIST_CONSENT: True})
+    backend.provider.proxy_url = PROXY
+    manager_class = _manager_class(monkeypatch)
+    with pytest.raises(LoginFailed):
+        # stops at the missing pairing, after the install
+        await backend.setup()
+    manager_class.assert_called_once_with(backend.mass, proxy_url=PROXY)
+
+
+async def test_the_refresh_before_a_run_goes_through_the_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The check for a newer build, made before every run, uses the proxy too."""
+    backend = _make_backend(tmp_path, {CONF_SOLOIST_API_KEY: "k" * 20})
+    backend.provider.proxy_url = PROXY
+    backend._server = MagicMock()
+    manager_class = _manager_class(monkeypatch)
+    with patch.object(soloist_backend._SingleTrackRun, "start", AsyncMock()):
+        await backend._acquire_run(TRACK_A, 0, _streamdetails_for(uri=TRACK_A), continuation=False)
+    manager_class.assert_called_once_with(backend.mass, proxy_url=PROXY)
+
+
+async def test_the_replacement_of_an_expired_build_goes_through_the_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An engine that expired is replaced by a download through the proxy."""
+    run = _make_run(tmp_path)
+    run.backend.provider.proxy_url = PROXY
+    manager_class = _manager_class(monkeypatch)
+    with pytest.raises(AudioError, match="replacement was installed"):
+        await run._handle_expired_build()
+    manager_class.assert_called_once_with(run.backend.mass, proxy_url=PROXY)

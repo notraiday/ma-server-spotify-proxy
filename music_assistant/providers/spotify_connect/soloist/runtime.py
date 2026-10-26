@@ -40,6 +40,7 @@ from music_assistant_models.errors import MusicAssistantError
 from yarl import URL
 
 from music_assistant.constants import MASS_LOGGER_NAME
+from music_assistant.helpers.aiohttp_client import get_proxy_request_kwargs
 from music_assistant.helpers.json import json_dumps, json_loads
 from music_assistant.helpers.process import check_output
 
@@ -339,13 +340,15 @@ class SoloistBinaryManager:
     share one download.
     """
 
-    def __init__(self, mass: MusicAssistant) -> None:
+    def __init__(self, mass: MusicAssistant, proxy_url: str = "") -> None:
         """
         Initialize the binary manager.
 
         :param mass: The MusicAssistant instance (for its HTTP session and storage path).
+        :param proxy_url: HTTP proxy the downloads go through, empty for a direct connection.
         """
         self.mass = mass
+        self._proxy_kwargs = get_proxy_request_kwargs(proxy_url)
         self._install_dir = Path(mass.storage_path) / "soloist"
         self._binary_path = self._install_dir / "soloist"
         self._previous_path = self._install_dir / "soloist.prev"
@@ -527,7 +530,10 @@ class SoloistBinaryManager:
         for _ in range(_MAX_REDIRECTS + 1):
             _validate_download_url(current_url)
             async with self.mass.http_session.head(
-                current_url, allow_redirects=False, timeout=ClientTimeout(total=_HEAD_TIMEOUT)
+                current_url,
+                allow_redirects=False,
+                timeout=ClientTimeout(total=_HEAD_TIMEOUT),
+                **self._proxy_kwargs,
             ) as resp:
                 if resp.status in _REDIRECT_STATUSES:
                     if not (location := resp.headers.get("Location")):
@@ -598,6 +604,7 @@ class SoloistBinaryManager:
                     current_url,
                     allow_redirects=False,
                     timeout=ClientTimeout(total=_DOWNLOAD_TIMEOUT),
+                    **self._proxy_kwargs,
                 ) as resp:
                     if resp.status in _REDIRECT_STATUSES:
                         location = resp.headers.get("Location")
